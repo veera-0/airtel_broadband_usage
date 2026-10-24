@@ -21,7 +21,7 @@ load_dotenv()
 ROUTER = os.getenv("ROUTER_IP", "https://192.168.1.1")
 USERNAME = "admin"
 
-PASSWORD = os.getenv("ROUTER_PASSWORD", "admin")
+PASSWORD = os.getenv("ROUTER_PASSWORD") or os.getenv("AIRFIBER_PASS", "admin")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CSV_FILE = os.path.join(HERE, "usage_log.csv")
