@@ -11,3 +11,4 @@ wheels/
 *.csv
 
 .env
+src/airtel_wifi_project/login_failures.txt
