@@ -160,3 +160,33 @@ The script connects to the router's HTTPS admin page using a self-signed
 certificate and permits legacy TLS settings for compatibility. Its TLS
 configuration does not verify the router certificate. Use it only on a trusted
 home network; do not expose the router admin page to the public internet.
+
+## CRON in Termux
+1. clone the repo: git clone https://github.com/veera-0/airtel_broadband_usage.git
+
+2. Update the phone
+
+cd ~/YOUR_PROJECT_FOLDER/YOUR_REPO_FOLDER
+git pull
+
+3. Create the password file (outside the repo)
+
+cat > ~/.airfiber_env <<'EOF'
+AIRFIBER_USER='admin'
+AIRFIBER_PASS='YOUR_ROUTER_PASSWORD'
+EOF
+chmod 600 ~/.airfiber_env
+
+4. Test it
+
+sh run_tracker.sh
+sh run_tracker.sh report
+
+Run these from the repo folder. You should see a timestamp line, then “Logged: ...”.
+
+5. Switch cron to the new script
+Your current cron entry points to the old ~/run_tracker.sh. Replace it, using your real folder path in the new line:
+
+crontab -l | grep -v run_tracker | crontab - ; (crontab -l 2>/dev/null; echo "0 */2 * * * sh $PWD/run_tracker.sh >> $HOME/tracker_run.log 2>&1") | crontab - && crontab -l
+
+Run this from inside the repo folder, because $PWD fills in the path for you. The last command should show a line ending in .../run_tracker.sh. Then delete the old copy with rm ~/run_tracker.sh
