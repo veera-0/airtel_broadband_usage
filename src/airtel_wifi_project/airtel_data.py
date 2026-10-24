@@ -14,10 +14,11 @@ import csv, hashlib, http.client, os, re, ssl, sys
 import urllib.error, urllib.parse, urllib.request
 from collections import defaultdict
 from datetime import date, datetime, time as dtime, timedelta
+import os
 
-ROUTER = "https://your_router_ip"
-USERNAME = os.environ.get("AIRFIBER_USER", "admin")        # <-- your router username
-PASSWORD = os.environ.get("AIRFIBER_PASS", "admin")    # <-- your router password
+ROUTER = os.environ.get("ROUTER_IP", "https://192.168.1.1")
+USERNAME = os.environ.get("AIRFIBER_USER", "admin")     
+PASSWORD = os.environ.get("AIRFIBER_PASS", "admin")   
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CSV_FILE = os.path.join(HERE, "usage_log.csv")
