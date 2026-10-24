@@ -11,7 +11,7 @@
 
 # Folder this script lives in. Keep it in the repo root, next to the src/ folder.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)" || exit 1
-ENV_FILE="${AIRFIBER_ENV_FILE:-$HOME/project/.airfiber_env}"
+ENV_FILE="${AIRFIBER_ENV_FILE:-$HOME/.airfiber_env}"
 
 if [ -f "$ENV_FILE" ]; then
     . "$ENV_FILE"
