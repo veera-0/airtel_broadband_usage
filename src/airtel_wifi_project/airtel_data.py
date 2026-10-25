@@ -18,6 +18,9 @@ import hashlib, http.client, json, os, re, ssl, sys, warnings
 import urllib.error, urllib.parse, urllib.request
 from collections import defaultdict
 from datetime import date, datetime, time as dtime, timedelta
+from dotenv import load_dotenv
+
+load_dotenv()
 
 try:
     from .supabase_service import SupabaseError, SupabaseService
