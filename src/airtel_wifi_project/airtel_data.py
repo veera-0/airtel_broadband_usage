@@ -2,30 +2,35 @@
 """
 Airtel AirFiber data tracker (router side). Python 3.8+, standard library only.
 
-  python airfiber_tracker.py log      -> log in, read PPPoE counters, append readable values (GB, days) to CSV
-  python airfiber_tracker.py report   -> daily and monthly usage from the CSV
+  python airfiber_tracker.py log        -> log in, read PPPoE counters, store the reading in Supabase
+  python airfiber_tracker.py report     -> usage report built from the Supabase rows
+  python airfiber_tracker.py db-latest  -> last 5 rows stored in Supabase
+
+Supabase is the only data store. If it is unreachable, readings wait in
+pending_supabase.jsonl (a temporary buffer) and are uploaded on the next run.
 
 Usage between two readings is the difference of the byte counters. If a counter
 goes down (router reboot / reconnect / Reset button) the new value is counted
 from zero. Anything used before the reset and after the last reading is lost,
 so log every 1-2 hours.
 """
-import csv, hashlib, http.client, os, re, ssl, sys
+import hashlib, http.client, json, os, re, ssl, sys, warnings
 import urllib.error, urllib.parse, urllib.request
 from collections import defaultdict
 from datetime import date, datetime, time as dtime, timedelta
-from dotenv import load_dotenv
 
+try:
+    from .supabase_service import SupabaseError, SupabaseService
+except ImportError:                      # run directly as a script
+    from supabase_service import SupabaseError, SupabaseService
 
-load_dotenv()
-ROUTER = os.getenv("ROUTER_IP", "https://192.168.1.1")
-USERNAME = "admin"
-
-PASSWORD = os.getenv("ROUTER_PASSWORD") or os.getenv("AIRFIBER_PASS", "admin")
+ROUTER = "https://192.168.1.1"
+USERNAME = os.environ.get("AIRFIBER_USER", "admin")        # <-- your router username
+PASSWORD = os.environ.get("AIRFIBER_PASS", "CHANGE_ME")    # <-- your router password
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CSV_FILE = os.path.join(HERE, "usage_log.csv")
 FAIL_FILE = os.path.join(HERE, "login_failures.txt")
+supabase = SupabaseService(pending_file=os.path.join(HERE, "pending_supabase.jsonl"))
 MAX_FAILURES = 2   # the router locks you out after 3 wrong attempts, so stop at 2
 
 # ---- Your plan -------------------------------------------------------------
@@ -34,6 +39,7 @@ CYCLE_START_DAY = 23           # day of the month your cap renews (1-28): check 
 USED_BEFORE_TRACKING_GB = 0.0  # data already used this cycle before the first log (from Airtel, or an estimate)
 WARN_PERCENT = 80              # flag when this much of the cap is used
 # -----------------------------------------------------------------------------
+
 
 LOGIN_PATH = "/cgi-bin/login_advance.cgi"
 LOGOUT_PATH = "/cgi-bin/logout_advance.cgi"
@@ -48,7 +54,9 @@ ctx.verify_mode = ssl.CERT_NONE
 ctx.options |= getattr(ssl, "OP_IGNORE_UNEXPECTED_EOF", 0)  # router closes without close_notify
 try:
     ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
-    ctx.minimum_version = ssl.TLSVersion.TLSv1
+    with warnings.catch_warnings():       # newer Pythons warn that TLSv1 is deprecated
+        warnings.simplefilter("ignore")
+        ctx.minimum_version = ssl.TLSVersion.TLSv1
 except Exception:
     pass
 
@@ -163,8 +171,6 @@ def read_counters():
 
 
 GB = 1e9   # decimal GB (1 GB = 1,000,000,000 bytes). Use 1024**3 if you prefer GiB.
-HEADER = ["timestamp", "uptime", "uptime_days", "downloaded_GB", "uploaded_GB",
-          "total_GB", "used_since_last_GB", "note"]
 
 
 def fmt_uptime(sec):
@@ -183,43 +189,74 @@ def usage_between(prev, cur):
     return cur[1] - prev[1], cur[2] - prev[2], False
 
 
-def load_rows():
-    if not os.path.exists(CSV_FILE):
-        return []
-    with open(CSV_FILE, newline="") as f:
-        reader = csv.DictReader(f)
-        if reader.fieldnames != HEADER:
-            return None     # old format
-        return list(reader)
+def parse_ts(text):
+    """Supabase timestamp -> datetime in this device's local timezone."""
+    return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone()
+
+
+def valid(r):
+    return all(r.get(k) is not None for k in ("recorded_at", "uptime_days", "downloaded_gb", "uploaded_gb"))
 
 
 def row_values(r):
-    return (float(r["uptime_days"]), float(r["downloaded_GB"]), float(r["uploaded_GB"]))
+    return (float(r["uptime_days"]), float(r["downloaded_gb"]), float(r["uploaded_gb"]))
+
+
+def require_db():
+    if not supabase.configured:
+        sys.exit("SUPABASE_URL / SUPABASE_KEY are not set (see ~/.airfiber_env). "
+                 "Supabase is the only data store, so it is required.")
+
+
+def previous_reading():
+    """The last stored reading: the newest queued row if offline rows are waiting,
+    otherwise the newest valid row in Supabase. Returns (row or None, error text or None)."""
+    queued = supabase.last_pending()
+    if queued:
+        return queued, None
+    try:
+        for r in supabase.latest(5):
+            if valid(r):
+                return r, None
+        return None, None
+    except (SupabaseError, urllib.error.URLError, OSError) as e:
+        return None, str(e)
 
 
 def do_log():
+    require_db()
     uptime_sec, sent, recv = read_counters()
-    rows = load_rows()
-    if rows is None:        # a file from the older raw-bytes version: keep it aside
-        os.replace(CSV_FILE, CSV_FILE.replace(".csv", "_old.csv"))
-        rows = []
-
     cur = (round(uptime_sec / 86400, 4), round(recv / GB, 4), round(sent / GB, 4))
-    used, note = 0.0, ""
-    if rows:
-        d_dn, d_up, reset = usage_between(row_values(rows[-1]), cur)
-        used = d_dn + d_up
-        note = "counter reset (usage before reset not counted)" if reset else ""
 
-    need_header = not os.path.exists(CSV_FILE) or os.path.getsize(CSV_FILE) == 0
-    with open(CSV_FILE, "a", newline="") as f:
-        w = csv.writer(f)
-        if need_header:
-            w.writerow(HEADER)
-        w.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), fmt_uptime(uptime_sec),
-                    cur[0], cur[1], cur[2], round(cur[1] + cur[2], 4), round(used, 4), note])
-    print(f"Logged: {fmt_uptime(uptime_sec)} up | downloaded {cur[1]:.2f} GB | "
-          f"uploaded {cur[2]:.2f} GB | used since last reading {used:.3f} GB")
+    prev, err = previous_reading()
+    used, note = 0.0, None
+    if prev:
+        d_dn, d_up, reset = usage_between(row_values(prev), cur)
+        used = d_dn + d_up
+        if reset:
+            note = "counter reset (usage before reset not counted)"
+    elif err:
+        used, note = None, "previous reading unavailable"
+
+    now = datetime.now().astimezone()
+    total = round(cur[1] + cur[2], 4)
+    used_text = "unknown (database unreachable)" if used is None else f"{used:.3f} GB"
+    print(f"Reading: {fmt_uptime(uptime_sec)} up | downloaded {cur[1]:.2f} GB | "
+          f"uploaded {cur[2]:.2f} GB | used since last reading {used_text}")
+    saved = supabase.insert_queued({
+        "recorded_at": now.isoformat(timespec="seconds"),
+        "uptime": fmt_uptime(uptime_sec),
+        "uptime_days": cur[0],
+        "downloaded_gb": cur[1],
+        "uploaded_gb": cur[2],
+        "total_gb": total,
+        "used_since_last_gb": None if used is None else round(used, 4),
+        "note": note,
+    })
+    if saved:
+        print(f"Supabase: saved {saved} row(s)")
+    else:
+        print("Not saved to Supabase yet. It is queued locally and will upload on the next run.")
 
 
 def cycle_start(d):
@@ -234,14 +271,30 @@ def next_cycle_start(start):
     return (start.replace(day=28) + timedelta(days=4)).replace(day=day)
 
 
-def do_report():
-    rows = load_rows()
+def do_db_latest():
+    if not supabase.configured:
+        sys.exit("SUPABASE_URL / SUPABASE_KEY are not set (see ~/.airfiber_env).")
+    rows = supabase.latest(5)
     if not rows:
-        sys.exit("No log yet. Run: python airfiber_tracker.py log")
+        print("No rows in Supabase yet.")
+    for r in rows:
+        print(f"{r['recorded_at']}  up {r['uptime']}  down {r['downloaded_gb']} GB  "
+              f"up {r['uploaded_gb']} GB  used {r['used_since_last_gb']} GB")
+
+
+def do_report():
+    require_db()
+    rows = [r for r in supabase.select_all(columns="recorded_at,uptime_days,downloaded_gb,uploaded_gb",
+                                           order="recorded_at.asc") if valid(r)]
+    if not rows:
+        sys.exit("No readings in Supabase yet. Run the 'log' command first.")
+    for r in rows:
+        r["_t"] = parse_ts(r["recorded_at"])
+
     daily = defaultdict(lambda: [0.0, 0.0])   # date -> [down, up]
     for prev, cur in zip(rows, rows[1:]):
         d_dn, d_up, _ = usage_between(row_values(prev), row_values(cur))
-        day = cur["timestamp"][:10]
+        day = cur["_t"].date()
         daily[day][0] += d_dn
         daily[day][1] += d_up
 
@@ -250,13 +303,12 @@ def do_report():
     cycles = defaultdict(float)               # cycle start date -> GB used
     for day in sorted(daily):
         dn, up = daily[day]
-        cycles[cycle_start(date.fromisoformat(day))] += dn + up
+        cycles[cycle_start(day)] += dn + up
     for day in sorted(daily)[-14:]:
         dn, up = daily[day]
-        print(f"{day:<12}{dn:>9.2f}{up:>9.2f}{dn + up:>9.2f}")
+        print(f"{str(day):<12}{dn:>9.2f}{up:>9.2f}{dn + up:>9.2f}")
 
-    first_cycle = cycle_start(date.fromisoformat(rows[0]["timestamp"][:10]))
-    cycles[first_cycle] += USED_BEFORE_TRACKING_GB
+    cycles[cycle_start(rows[0]["_t"].date())] += USED_BEFORE_TRACKING_GB
 
     now = datetime.now()
     start = cycle_start(now.date())
@@ -294,9 +346,10 @@ def do_report():
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
-    if cmd not in ("log", "report"):
+    commands = {"log": do_log, "report": do_report, "db-latest": do_db_latest}
+    if cmd not in commands:
         sys.exit(__doc__)
     try:
-        {"log": do_log, "report": do_report}[cmd]()
-    except (urllib.error.URLError, ssl.SSLError, OSError, RuntimeError) as e:
+        commands[cmd]()
+    except (urllib.error.URLError, ssl.SSLError, OSError, RuntimeError, SupabaseError) as e:
         sys.exit(f"Error: {e}")
