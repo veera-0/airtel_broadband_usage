@@ -23,7 +23,7 @@ if [ -z "$AIRFIBER_PASS" ]; then
 fi
 
 AIRFIBER_USER="${AIRFIBER_USER:-admin}"
-export AIRFIBER_USER AIRFIBER_PASS
+export AIRFIBER_USER AIRFIBER_PASS SUPABASE_URL SUPABASE_KEY
 
 cd "$SCRIPT_DIR" || exit 1
 echo "--- $(date '+%Y-%m-%d %H:%M:%S') ---"
