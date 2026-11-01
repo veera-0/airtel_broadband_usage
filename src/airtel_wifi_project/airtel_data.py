@@ -185,11 +185,13 @@ def fmt_uptime(sec):
 
 def usage_between(prev, cur):
     """prev/cur = (uptime_days, downloaded_GB, uploaded_GB).
-    Returns (down_GB, up_GB, was_reset). After a reset the counters start from zero."""
-    reset = cur[0] < prev[0] or cur[1] < prev[1] or cur[2] < prev[2]
-    if reset:
-        return cur[1], cur[2], True
-    return cur[1] - prev[1], cur[2] - prev[2], False
+    Returns (down_GB, up_GB, was_reset). Uptime can reset on reconnect while traffic
+    counters remain cumulative, so only a decreasing traffic counter signals its reset."""
+    down_reset = cur[1] < prev[1]
+    up_reset = cur[2] < prev[2]
+    down = cur[1] if down_reset else cur[1] - prev[1]
+    up = cur[2] if up_reset else cur[2] - prev[2]
+    return down, up, down_reset or up_reset
 
 
 def parse_ts(text):
@@ -301,9 +303,7 @@ def do_log():
         "downloaded_gb": cur[1],
         "uploaded_gb": cur[2],
         "total_gb": total,
-        # Kept under its existing column name for database compatibility; this
-        # value is now the cumulative total for the current billing cycle.
-        "used_since_last_gb": cycle_used,
+        "total_data_usage_in_cycle": cycle_used,
         "note": note,
     })
     if saved:
@@ -332,7 +332,7 @@ def do_db_latest():
         print("No rows in Supabase yet.")
     for r in rows:
         print(f"{r['recorded_at']}  up {r['uptime']}  down {r['downloaded_gb']} GB  "
-              f"up {r['uploaded_gb']} GB  used {r['used_since_last_gb']} GB")
+              f"up {r['uploaded_gb']} GB  cycle used {r['total_data_usage_in_cycle']} GB")
 
 
 def do_report():
