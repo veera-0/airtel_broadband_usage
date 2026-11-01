@@ -144,10 +144,14 @@ billing cycle. The cycle settings are constants near the top of the script:
 - `WARN_PERCENT`: usage percentage at which the report adds a note
 
 The router counters are cumulative. The script calculates usage by comparing
-successive readings; after a router/counter reset, it counts from the new
-counters and marks the row. Usage during missed intervals or before a reset
-cannot be recovered, so run the tracker regularly. The report attributes the
-usage between readings to the date of the later reading.
+successive readings and stores the cumulative usage for the current billing
+cycle in each new row's `used_since_last_gb` field (the field name is retained
+for compatibility). When router counters reset, the new counter value is
+added to the usage already logged in that cycle. The cycle total starts over
+on the 23rd (the configured `CYCLE_START_DAY`); router counters themselves do
+not need to be reset. Usage during missed intervals or while the router is
+offline cannot be recovered, so run the tracker regularly. The report
+attributes usage between readings to the date of the later reading.
 
 After two consecutive failed logins the script stops making login attempts to
 avoid triggering the router's lockout. Check the credentials and whether

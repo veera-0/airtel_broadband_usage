@@ -125,8 +125,12 @@ class SupabaseService:
 
     def last_pending(self):
         """Newest row still waiting to be uploaded, or None."""
-        rows = self._load_pending()
+        rows = self.pending_rows()
         return rows[-1] if rows else None
+
+    def pending_rows(self):
+        """Rows waiting to be uploaded, oldest first."""
+        return self._load_pending()
 
     def _save_pending(self, rows):
         if not self.pending_file:

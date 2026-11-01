@@ -10,9 +10,9 @@ Supabase is the only data store. If it is unreachable, readings wait in
 pending_supabase.jsonl (a temporary buffer) and are uploaded on the next run.
 
 Usage between two readings is the difference of the byte counters. If a counter
-goes down (router reboot / reconnect / Reset button) the new value is counted
-from zero. Anything used before the reset and after the last reading is lost,
-so log every 1-2 hours.
+goes down (router reboot / reconnect / Reset button), usage already logged in
+the current billing cycle is retained and the new counter value is added to it.
+The billing-cycle total starts over on CYCLE_START_DAY.
 """
 import hashlib, http.client, json, os, re, ssl, sys, warnings
 import urllib.error, urllib.parse, urllib.request
@@ -211,19 +211,50 @@ def require_db():
                  "Supabase is the only data store, so it is required.")
 
 
-def previous_reading():
-    """The last stored reading: the newest queued row if offline rows are waiting,
-    otherwise the newest valid row in Supabase. Returns (row or None, error text or None)."""
-    queued = supabase.last_pending()
-    if queued:
-        return queued, None
+def cycle_readings(start):
+    """Return the last pre-cycle reading and all readings in this cycle."""
+    cycle_start = datetime.combine(start, dtime()).astimezone().isoformat()
+    queued = supabase.pending_rows()
     try:
-        for r in supabase.latest(5):
-            if valid(r):
-                return r, None
-        return None, None
+        columns = "recorded_at,uptime_days,downloaded_gb,uploaded_gb"
+        rows = supabase.select_all(
+            filters={"recorded_at": f"gte.{cycle_start}"},
+            columns=columns,
+            order="recorded_at.asc",
+        )
+        prior = supabase.select(
+            filters={"recorded_at": f"lt.{cycle_start}"},
+            columns=columns,
+            order="recorded_at.desc",
+            limit=1,
+        )
     except (SupabaseError, urllib.error.URLError, OSError) as e:
         return None, str(e)
+
+    by_timestamp = {
+        r["recorded_at"]: r
+        for r in rows + prior + queued
+        if valid(r)
+    }
+    readings = sorted(by_timestamp.values(), key=lambda r: parse_ts(r["recorded_at"]))
+    return [r for r in readings if parse_ts(r["recorded_at"]).date() < start][-1:] + [
+        r for r in readings if parse_ts(r["recorded_at"]).date() >= start
+    ], None
+
+
+def cycle_usage(readings, start):
+    """Sum logged usage attributed to this cycle, carrying usage across counter resets."""
+    total = 0.0
+    if not readings:
+        return total
+    if parse_ts(readings[0]["recorded_at"]).date() >= start:
+        total += row_values(readings[0])[1] + row_values(readings[0])[2]
+    for prev, cur in zip(readings, readings[1:]):
+        if parse_ts(cur["recorded_at"]).date() < start:
+            continue
+        down, up, _ = usage_between(row_values(prev), row_values(cur))
+        total += down + up
+    return total
 
 
 def do_log():
@@ -231,21 +262,38 @@ def do_log():
     uptime_sec, sent, recv = read_counters()
     cur = (round(uptime_sec / 86400, 4), round(recv / GB, 4), round(sent / GB, 4))
 
-    prev, err = previous_reading()
-    used, note = 0.0, None
-    if prev:
-        d_dn, d_up, reset = usage_between(row_values(prev), cur)
-        used = d_dn + d_up
-        if reset:
-            note = "counter reset (usage before reset not counted)"
-    elif err:
-        used, note = None, "previous reading unavailable"
-
     now = datetime.now().astimezone()
+    start = cycle_start(now.date())
+    readings, err = cycle_readings(start)
+    used_since_reading, note = 0.0, None
+    cycle_used = None
+    if readings is not None:
+        prev = readings[-1] if readings else None
+        if prev:
+            down, up, reset = usage_between(row_values(prev), cur)
+            used_since_reading = down + up
+            if reset:
+                note = "counter reset; cycle total retains prior logged usage"
+        else:
+            used_since_reading = cur[1] + cur[2]
+        current = {
+            "recorded_at": now.isoformat(timespec="seconds"),
+            "uptime_days": cur[0],
+            "downloaded_gb": cur[1],
+            "uploaded_gb": cur[2],
+        }
+        cycle_used = round(cycle_usage(readings + [current], start), 4)
+    else:
+        used_since_reading = None
+        note = f"cycle history unavailable: {err}"
+
     total = round(cur[1] + cur[2], 4)
-    used_text = "unknown (database unreachable)" if used is None else f"{used:.3f} GB"
+    used_text = ("unknown (cycle history unavailable)" if used_since_reading is None else
+                 f"{used_since_reading:.3f} GB")
+    cycle_text = "unknown" if cycle_used is None else f"{cycle_used:.3f} GB"
     print(f"Reading: {fmt_uptime(uptime_sec)} up | downloaded {cur[1]:.2f} GB | "
-          f"uploaded {cur[2]:.2f} GB | used since last reading {used_text}")
+          f"uploaded {cur[2]:.2f} GB | used since last reading {used_text} | "
+          f"cycle used {cycle_text}")
     saved = supabase.insert_queued({
         "recorded_at": now.isoformat(timespec="seconds"),
         "uptime": fmt_uptime(uptime_sec),
@@ -253,7 +301,9 @@ def do_log():
         "downloaded_gb": cur[1],
         "uploaded_gb": cur[2],
         "total_gb": total,
-        "used_since_last_gb": None if used is None else round(used, 4),
+        # Kept under its existing column name for database compatibility; this
+        # value is now the cumulative total for the current billing cycle.
+        "used_since_last_gb": cycle_used,
         "note": note,
     })
     if saved:
